@@ -149,6 +149,11 @@ public:
     prewarm();
   }
 
+  /// \brief Scale model-internal temporal convolutions when running at an oversampled rate.
+  ///
+  /// Most model types do not have time-scaled convolutions, so the default is a no-op.
+  virtual void SetTimeScale(const int scale) { (void)scale; }
+
   /// \brief Set the input level
   /// \param inputLevel Input level in dBu
   void SetInputLevel(const double inputLevel);

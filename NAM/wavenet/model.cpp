@@ -55,13 +55,19 @@ void nam::wavenet::detail::Head::SetMaxBufferSize(const int maxBufferSize)
     _convs[i].SetMaxBufferSize(maxBufferSize);
 }
 
+void nam::wavenet::detail::Head::SetTimeScale(const int scale)
+{
+  for (auto& conv : _convs)
+    conv.SetDilationScale(scale);
+}
+
 long nam::wavenet::detail::Head::receptive_field() const
 {
   long rf = 1;
   for (size_t i = 0; i < _convs.size(); i++)
   {
     const long k = _convs[i].get_kernel_size();
-    rf += k - 1;
+    rf += (k - 1) * _convs[i].get_dilation();
   }
   return rf;
 }
@@ -413,6 +419,13 @@ void nam::wavenet::detail::LayerArray::SetMaxBufferSize(const int maxBufferSize)
   this->_head_inputs.resize(this->_head_output_size, maxBufferSize);
 }
 
+void nam::wavenet::detail::LayerArray::SetTimeScale(const int scale)
+{
+  for (auto& layer : _layers)
+    layer.SetTimeScale(scale);
+  _head_rechannel.SetDilationScale(scale);
+}
+
 
 long nam::wavenet::detail::LayerArray::get_receptive_field() const
 {
@@ -642,6 +655,22 @@ void nam::wavenet::WaveNet::set_weights_(std::vector<float>& weights)
     ss << "Weight mismatch: provided " << weights.size() << " weights, but the model expects more.";
     throw std::runtime_error(ss.str().c_str());
   }
+}
+
+void nam::wavenet::WaveNet::SetTimeScale(const int scale)
+{
+  if (_condition_dsp != nullptr)
+    _condition_dsp->SetTimeScale(scale);
+  for (auto& layer_array : _layer_arrays)
+    layer_array.SetTimeScale(scale);
+  if (_post_stack_head != nullptr)
+    _post_stack_head->SetTimeScale(scale);
+
+  mPrewarmSamples = this->_condition_dsp != nullptr ? this->_condition_dsp->PrewarmSamples() : 1;
+  for (size_t i = 0; i < this->_layer_arrays.size(); i++)
+    mPrewarmSamples += this->_layer_arrays[i].get_receptive_field();
+  if (this->_post_stack_head != nullptr)
+    mPrewarmSamples += this->_post_stack_head->receptive_field() - 1;
 }
 
 void nam::wavenet::WaveNet::SetMaxBufferSize(const int maxBufferSize)

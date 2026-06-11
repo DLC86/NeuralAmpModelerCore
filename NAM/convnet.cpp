@@ -1,5 +1,4 @@
-#include <algorithm> // std::max_element
-#include <algorithm>
+#include <algorithm> // std::max, std::max_element
 #include <cmath> // pow, tanh, expf
 #include <filesystem>
 #include <fstream>
@@ -68,6 +67,11 @@ void nam::convnet::ConvNetBlock::SetMaxBufferSize(const int maxBufferSize)
   this->_output.setZero();
 }
 
+void nam::convnet::ConvNetBlock::SetTimeScale(const int scale)
+{
+  this->conv.SetDilationScale(scale);
+}
+
 void nam::convnet::ConvNetBlock::Process(const Eigen::MatrixXf& input, const int num_frames)
 {
   // Process input with Conv1D
@@ -128,6 +132,11 @@ void nam::convnet::ConvNetBlock::process_(const Eigen::MatrixXf& input, Eigen::M
 long nam::convnet::ConvNetBlock::get_out_channels() const
 {
   return this->conv.get_out_channels();
+}
+
+long nam::convnet::ConvNetBlock::get_receptive_field() const
+{
+  return (this->conv.get_kernel_size() - 1) * this->conv.get_dilation();
 }
 
 nam::convnet::_Head::_Head(const int in_channels, const int out_channels, std::vector<float>::iterator& weights)
@@ -292,6 +301,21 @@ void nam::convnet::ConvNet::SetMaxBufferSize(const int maxBufferSize)
   {
     block.SetMaxBufferSize(maxBufferSize);
   }
+}
+
+void nam::convnet::ConvNet::SetTimeScale(const int scale)
+{
+  for (auto& block : _blocks)
+    block.SetTimeScale(scale);
+
+  mPrewarmSamples = 1;
+  int maxReceptiveField = 1;
+  for (const auto& block : _blocks)
+  {
+    maxReceptiveField = std::max(maxReceptiveField, static_cast<int>(block.get_receptive_field()));
+    mPrewarmSamples += static_cast<int>(block.get_receptive_field());
+  }
+  _set_receptive_field(maxReceptiveField);
 }
 
 void nam::convnet::ConvNet::_update_buffers_(NAM_SAMPLE** input, const int num_frames)

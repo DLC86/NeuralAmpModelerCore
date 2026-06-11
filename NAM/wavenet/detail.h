@@ -162,6 +162,9 @@ public:
   /// \param weights Iterator to the weights vector. Will be advanced as weights are consumed.
   void set_weights_(std::vector<float>::iterator& weights);
 
+  /// \brief Scale the temporal dilation of the layer's Conv1D.
+  void SetTimeScale(const int scale) { _conv.SetDilationScale(scale); }
+
   /// \brief Process a block of frames
   ///
   /// Performs the complete layer computation:
@@ -328,6 +331,9 @@ public:
   /// \param it Iterator to the weights vector. Will be advanced as weights are consumed.
   void set_weights_(std::vector<float>::iterator& it);
 
+  /// \brief Scale all temporal Conv1D dilations in the layer array.
+  void SetTimeScale(const int scale);
+
   /// \brief Get the "zero-indexed" receptive field
   ///
   /// The receptive field is the number of input samples that affect the output.
@@ -366,6 +372,7 @@ public:
 
   void set_weights_(std::vector<float>::iterator& weights);
   void SetMaxBufferSize(int maxBufferSize);
+  void SetTimeScale(int scale);
   long receptive_field() const;
   int in_channels() const { return _in_channels; }
   int out_channels() const { return _out_channels; }

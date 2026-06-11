@@ -75,6 +75,8 @@ public:
   /// \param maxBufferSize Maximum number of frames to process in a single call
   void SetMaxBufferSize(const int maxBufferSize);
 
+  void SetTimeScale(const int scale);
+
   /// \brief Process input matrix directly (new API, similar to WaveNet)
   /// \param input Input matrix (channels x num_frames)
   /// \param num_frames Number of frames to process
@@ -95,6 +97,8 @@ public:
   /// \brief Get the number of output channels
   /// \return Number of output channels
   long get_out_channels() const;
+
+  long get_receptive_field() const;
 
   Conv1D conv; ///< The dilated convolution layer
 
@@ -150,6 +154,8 @@ public:
   /// \brief Resize all buffers to handle maxBufferSize frames
   /// \param maxBufferSize Maximum number of frames to process in a single call
   void SetMaxBufferSize(const int maxBufferSize) override;
+
+  void SetTimeScale(const int scale) override;
 
 protected:
   std::vector<ConvNetBlock> _blocks;

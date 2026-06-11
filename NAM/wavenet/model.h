@@ -66,6 +66,9 @@ public:
   /// \param weights Iterator to the weights vector. Will be advanced as weights are consumed.
   void set_weights_(std::vector<float>::iterator& weights);
 
+  /// \brief Scale internal temporal convolutions for oversampled processing.
+  void SetTimeScale(const int scale) override;
+
 protected:
   // Element-wise arrays:
   Eigen::MatrixXf _condition_input;

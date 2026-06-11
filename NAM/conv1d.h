@@ -113,6 +113,10 @@ public:
   /// \return Dilation factor
   int get_dilation() const { return this->_dilation; };
 
+  /// \brief Scale the base dilation used by this convolution.
+  /// \param scale Integer scale factor, clamped to at least 1
+  void SetDilationScale(const int scale);
+
   /// \brief Check if bias is used
   /// \return true if bias is present, false otherwise
   bool has_bias() const { return this->_bias.size() > 0; };
@@ -126,12 +130,34 @@ protected:
   bool _is_depthwise = false;
   int _channels = 0; // Used for depthwise case (in_channels == out_channels)
   Eigen::VectorXf _bias;
+  int _base_dilation = 1;
   int _dilation;
   int _num_groups;
 
 private:
+  struct BiquadCoefficients
+  {
+    float b0 = 1.0f;
+    float b1 = 0.0f;
+    float b2 = 0.0f;
+    float a1 = 0.0f;
+    float a2 = 0.0f;
+  };
+
+  struct BiquadState
+  {
+    float z1 = 0.0f;
+    float z2 = 0.0f;
+  };
+
+  void DesignAntiImagingFilter();
+  void ApplyAntiImagingFilter(const int num_frames);
+
   RingBuffer _input_buffer; // Ring buffer for input (channels x buffer_size)
   Eigen::MatrixXf _output; // Pre-allocated output buffer (out_channels x maxBufferSize)
   int _max_buffer_size = 0; // Stored maxBufferSize
+  int _dilation_scale = 1;
+  std::vector<BiquadCoefficients> _anti_imaging_coefficients;
+  std::vector<BiquadState> _anti_imaging_state;
 };
 } // namespace nam

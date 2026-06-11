@@ -66,6 +66,7 @@ public:
   ~A2FastModel() override = default;
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames) override;
+  void SetTimeScale(const int scale) override;
 
 protected:
   void SetMaxBufferSize(int maxBufferSize) override;
@@ -121,6 +122,8 @@ private:
   // Head scale is stored as the trailing float in the weights stream (the generic
   // WaveNet reads it the same way, overriding the JSON head_scale field).
   float _head_scale = 1.0f;
+  int _time_scale = 1;
+  int _head_dilation = 1;
 
   // Head ring buffer (Channels rows, col-major). Same ring layout as per-layer.
   std::vector<float> _head_history;
@@ -142,6 +145,7 @@ private:
 
   int _prewarm_samples = 0;
 
+  void _update_time_scaled_dilations();
   void _load_weights(std::vector<float>& weights);
   void _ring_write(Layer& L, int num_frames);
   void _head_ring_write(int num_frames);
@@ -172,10 +176,31 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
 
   _load_weights(weights);
 
+  _update_time_scaled_dilations();
+}
+
+template <int Channels>
+void A2FastModel<Channels>::SetTimeScale(const int scale)
+{
+  _time_scale = std::max(1, scale);
+  _update_time_scaled_dilations();
+}
+
+template <int Channels>
+void A2FastModel<Channels>::_update_time_scaled_dilations()
+{
+  for (int i = 0; i < kNumLayers; i++)
+  {
+    _layers[i].dilation = kDilations[i] * _time_scale;
+    _layers[i].max_lookback = (kKernelSizes[i] - 1) * _layers[i].dilation;
+  }
+
+  _head_dilation = _time_scale;
+
   int prewarm = 0;
   for (int i = 0; i < kNumLayers; i++)
     prewarm += _layers[i].max_lookback;
-  prewarm += kHeadKernelSize - 1;
+  prewarm += (kHeadKernelSize - 1) * _head_dilation;
   _prewarm_samples = prewarm;
 }
 
@@ -312,7 +337,7 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   #endif
   }
 
-  const int head_lookback = kHeadKernelSize - 1;
+  const int head_lookback = (kHeadKernelSize - 1) * _head_dilation;
   #if NAM_A2_RING_MODE == 1
   _head_pow2_size = next_pow2(head_lookback + maxBufferSize);
   _head_pow2_mask = _head_pow2_size - 1;
@@ -627,10 +652,12 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
   _head_ring_write(num_frames);
   #if NAM_A2_RING_MODE == 1
   const int mask = _head_pow2_mask;
-  auto col_of = [&](int f, int k) { return (_head_write_pos - num_frames + f - (kHeadKernelSize - 1 - k)) & mask; };
+  auto col_of = [&](int f, int k) {
+    return (_head_write_pos - num_frames + f - (kHeadKernelSize - 1 - k) * _head_dilation) & mask;
+  };
   #else
   const int base = _head_write_pos - num_frames;
-  auto col_of = [&](int f, int k) { return base + f - (kHeadKernelSize - 1 - k); };
+  auto col_of = [&](int f, int k) { return base + f - (kHeadKernelSize - 1 - k) * _head_dilation; };
   #endif
 
   for (int f = 0; f < num_frames; f++)

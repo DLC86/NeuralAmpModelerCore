@@ -37,6 +37,7 @@ public:
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
   void prewarm() override;
   void Reset(const double sampleRate, const int maxBufferSize) override;
+  void SetTimeScale(const int scale) override;
   void SetSlimmableSize(const double val) override;
 
 protected:
@@ -46,6 +47,7 @@ private:
   std::vector<Submodel> _submodels;
   std::atomic<size_t> _active_index{0};
   std::mutex _slim_set_mutex;
+  int _time_scale = 1;
 };
 
 // Config / registration

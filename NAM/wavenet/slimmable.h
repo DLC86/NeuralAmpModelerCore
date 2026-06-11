@@ -48,6 +48,7 @@ public:
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
   void prewarm() override;
   void Reset(const double sampleRate, const int maxBufferSize) override;
+  void SetTimeScale(const int scale) override;
   void SetSlimmableSize(const double val) override;
 
 protected:
@@ -80,6 +81,7 @@ private:
   std::vector<int> _current_channels;
   int _current_buffer_size = 0;
   double _current_sample_rate = 0.0;
+  int _time_scale = 1;
 
   std::unique_ptr<DSP> _create_wavenet_for_channels(const std::vector<int>& target_channels);
   void _rebuild_model(const std::vector<int>& target_channels);

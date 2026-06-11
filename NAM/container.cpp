@@ -75,6 +75,14 @@ void ContainerModel::Reset(const double sampleRate, const int maxBufferSize)
   _submodels[active_index].model->Reset(sampleRate, maxBufferSize);
 }
 
+void ContainerModel::SetTimeScale(const int scale)
+{
+  std::lock_guard<std::mutex> lock(_slim_set_mutex);
+  _time_scale = std::max(1, scale);
+  for (auto& submodel : _submodels)
+    submodel.model->SetTimeScale(_time_scale);
+}
+
 void ContainerModel::SetSlimmableSize(const double val)
 {
   size_t active_index = _submodels.size() - 1;
@@ -102,6 +110,7 @@ void ContainerModel::SetSlimmableSize(const double val)
   }
   // Setting _active_index puts the model in the RT path, so reset before doing that.
   const double sr = mHaveExternalSampleRate ? mExternalSampleRate : mExpectedSampleRate;
+  _submodels[active_index].model->SetTimeScale(_time_scale);
   _submodels[active_index].model->Reset(sr, GetMaxBufferSize());
 
   // Finally set when we're ready:
