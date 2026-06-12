@@ -116,7 +116,6 @@ void Conv1D::SetDilationScale(const int scale)
 {
   this->_dilation_scale = std::max(1, scale);
   this->_dilation = this->_base_dilation * this->_dilation_scale;
-  DesignAntiImagingFilter();
   if (_max_buffer_size > 0)
     SetMaxBufferSize(_max_buffer_size);
 }
@@ -150,7 +149,6 @@ void Conv1D::SetMaxBufferSize(const int maxBufferSize)
   const long out_channels = get_out_channels();
   _output.resize(out_channels, maxBufferSize);
   _output.setZero();
-  DesignAntiImagingFilter();
 }
 
 
@@ -726,70 +724,8 @@ void Conv1D::Process(const Eigen::MatrixXf& input, const int num_frames)
 #endif
   }
 
-  ApplyAntiImagingFilter(num_frames);
-
   // Advance ring buffer write pointer after processing
   _input_buffer.Advance(num_frames);
-}
-
-void Conv1D::DesignAntiImagingFilter()
-{
-  _anti_imaging_coefficients.clear();
-  _anti_imaging_state.clear();
-
-  if (_dilation_scale <= 1 || get_out_channels() <= 0)
-    return;
-
-  constexpr double pi = 3.14159265358979323846264338327950288;
-  constexpr int order = 8;
-  constexpr int numSections = order / 2;
-  const double cutoff = std::min(0.49, 0.475 / static_cast<double>(_dilation_scale));
-  const double omega = 2.0 * pi * cutoff;
-  const double sinOmega = std::sin(omega);
-  const double cosOmega = std::cos(omega);
-
-  _anti_imaging_coefficients.resize(numSections);
-  for (int section = 0; section < numSections; section++)
-  {
-    const double q = 1.0 / (2.0 * std::cos((2.0 * section + 1.0) * pi / (2.0 * order)));
-    const double alpha = sinOmega / (2.0 * q);
-    const double a0 = 1.0 + alpha;
-
-    BiquadCoefficients coeffs;
-    coeffs.b0 = static_cast<float>((1.0 - cosOmega) * 0.5 / a0);
-    coeffs.b1 = static_cast<float>((1.0 - cosOmega) / a0);
-    coeffs.b2 = static_cast<float>((1.0 - cosOmega) * 0.5 / a0);
-    coeffs.a1 = static_cast<float>((-2.0 * cosOmega) / a0);
-    coeffs.a2 = static_cast<float>((1.0 - alpha) / a0);
-    _anti_imaging_coefficients[section] = coeffs;
-  }
-
-  _anti_imaging_state.assign(get_out_channels() * _anti_imaging_coefficients.size(), BiquadState {});
-}
-
-void Conv1D::ApplyAntiImagingFilter(const int num_frames)
-{
-  if (_anti_imaging_coefficients.empty())
-    return;
-
-  const long outChannels = get_out_channels();
-  for (long ch = 0; ch < outChannels; ch++)
-  {
-    for (int s = 0; s < num_frames; s++)
-    {
-      float y = _output(ch, s);
-      for (size_t section = 0; section < _anti_imaging_coefficients.size(); section++)
-      {
-        const auto& coeffs = _anti_imaging_coefficients[section];
-        auto& state = _anti_imaging_state[ch * _anti_imaging_coefficients.size() + section];
-        const float out = coeffs.b0 * y + state.z1;
-        state.z1 = coeffs.b1 * y - coeffs.a1 * out + state.z2;
-        state.z2 = coeffs.b2 * y - coeffs.a2 * out;
-        y = out;
-      }
-      _output(ch, s) = y;
-    }
-  }
 }
 
 void Conv1D::process_(const Eigen::MatrixXf& input, Eigen::MatrixXf& output, const long i_start, const long ncols,
