@@ -58,6 +58,10 @@ public:
   /// \param num_frames Number of frames to process
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
 
+  bool SupportsStridedProcess() const override { return NumInputChannels() == 1 && NumOutputChannels() == 1; }
+  void process_strided(const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride,
+                       const int num_frames) override;
+
   /// \brief Set model weights from a vector
   /// \param weights Vector containing all model weights
   void set_weights_(std::vector<float>& weights);

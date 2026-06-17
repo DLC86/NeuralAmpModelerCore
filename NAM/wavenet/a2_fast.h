@@ -16,7 +16,9 @@
 
   #include <array>
   #include <memory>
+  #include <vector>
 
+  #include "../dsp.h"
   #include "../model_config.h"
   #include "json.hpp"
 
@@ -51,6 +53,12 @@ bool is_a2_shape(const nlohmann::json& config, int* channels);
 /// \brief Build a ModelConfig that instantiates the A2 fast path.
 /// \pre is_a2_shape(config, ...) returned true.
 std::unique_ptr<ModelConfig> create_a2_fast_config(const nlohmann::json& config, double sampleRate);
+
+/// Returns true only for the specialized A2Fast DSP implementation.
+bool is_a2_fast_dsp(const nam::DSP* dsp);
+
+/// Runtime control used by the plugin OS Multi-Core UI.
+void SetFrameOMPRuntimeConfig(bool enabled, int threads, int minFrames, int minChunk);
 
 } // namespace a2_fast
 } // namespace wavenet

@@ -286,6 +286,79 @@ void nam::convnet::ConvNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, con
   nam::Buffer::_advance_input_buffer_(num_frames);
 }
 
+
+void nam::convnet::ConvNet::process_strided(
+  const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride, const int num_frames)
+{
+  if (NumInputChannels() != 1 || NumOutputChannels() != 1)
+    throw std::runtime_error("ConvNet::process_strided supports mono models only.");
+
+  constexpr long kInputBufferSafetyFactor = 32;
+  const long minimum_input_buffer_size = static_cast<long>(this->_receptive_field)
+                                       + kInputBufferSafetyFactor * static_cast<long>(num_frames);
+
+  if (this->_input_buffers[0].size() < static_cast<size_t>(minimum_input_buffer_size))
+  {
+    long new_buffer_size = 2;
+    while (new_buffer_size < minimum_input_buffer_size)
+      new_buffer_size *= 2;
+    this->_input_buffers[0].resize(static_cast<size_t>(new_buffer_size));
+    std::fill(this->_input_buffers[0].begin(), this->_input_buffers[0].end(), 0.0f);
+  }
+
+  const long buffer_size = static_cast<long>(this->_input_buffers[0].size());
+  if (this->_input_buffer_offset + num_frames > buffer_size)
+    this->_rewind_buffers_();
+
+  for (long i = this->_input_buffer_offset, j = 0; j < num_frames; i++, j++)
+    this->_input_buffers[0][i] = static_cast<float>(input[static_cast<size_t>(j) * inputStride]);
+
+  this->_output_buffers[0].resize(num_frames);
+  std::fill(this->_output_buffers[0].begin(), this->_output_buffers[0].end(), 0.0f);
+
+  const int in_channels = NumInputChannels();
+
+  Eigen::MatrixXf input_matrix(in_channels, num_frames);
+  const long i_start = this->_input_buffer_offset;
+  for (int i = 0; i < num_frames; i++)
+    input_matrix(0, i) = this->_input_buffers[0][i_start + i];
+
+  for (size_t i = 0; i < this->_blocks.size(); i++)
+  {
+    Eigen::MatrixXf block_input;
+    if (i == 0)
+    {
+      block_input = input_matrix;
+    }
+    else
+    {
+      auto prev_output = this->_blocks[i - 1].GetOutput(num_frames);
+      block_input = prev_output;
+    }
+
+    this->_blocks[i].Process(block_input, num_frames);
+  }
+
+  const long out_buffer_size = static_cast<long>(this->_input_buffers[0].size());
+  if (this->_block_vals[0].rows() != this->_blocks.back().get_out_channels()
+      || this->_block_vals[0].cols() != out_buffer_size)
+  {
+    this->_block_vals[0].resize(this->_blocks.back().get_out_channels(), out_buffer_size);
+  }
+
+  auto last_output = this->_blocks.back().GetOutput(num_frames);
+  const long buffer_offset = this->_input_buffer_offset;
+  const long buffer_i_end = buffer_offset + num_frames;
+  this->_block_vals[0].block(0, buffer_offset, last_output.rows(), num_frames) = last_output;
+
+  this->_head.process_(this->_block_vals[0], this->_head_output, buffer_offset, buffer_i_end);
+
+  for (int s = 0; s < num_frames; s++)
+    output[static_cast<size_t>(s) * outputStride] = this->_head_output(0, s);
+
+  nam::Buffer::_advance_input_buffer_(num_frames);
+}
+
 void nam::convnet::ConvNet::_verify_weights(const int channels, const std::vector<int>& dilations, const bool batchnorm,
                                             const size_t actual_weights)
 {

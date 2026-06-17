@@ -432,7 +432,7 @@ long nam::wavenet::detail::LayerArray::get_receptive_field() const
   long result = 0;
   for (size_t i = 0; i < this->_layers.size(); i++)
     result += this->_layers[i].get_dilation() * (this->_layers[i].get_kernel_size() - 1);
-  result += (long)this->_head_rechannel.get_kernel_size() - 1;
+  result += ((long)this->_head_rechannel.get_kernel_size() - 1) * this->_head_rechannel.get_dilation();
   return result;
 }
 
@@ -851,6 +851,65 @@ void nam::wavenet::WaveNet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, con
       }
     }
   }
+}
+
+
+void nam::wavenet::WaveNet::process_strided(
+  const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride, const int num_frames)
+{
+  assert(num_frames <= mMaxBufferSize);
+
+  if (NumInputChannels() != 1 || NumOutputChannels() != 1)
+    throw std::runtime_error("WaveNet::process_strided supports mono models only.");
+
+  for (int j = 0; j < num_frames; j++)
+    this->_condition_input(0, j) = input[static_cast<size_t>(j) * inputStride];
+
+  this->_process_condition(num_frames);
+
+  // Main layer arrays:
+  for (size_t i = 0; i < this->_layer_arrays.size(); i++)
+  {
+    if (i == 0)
+    {
+      this->_layer_arrays[i].Process(this->_condition_input, this->_condition_output, num_frames);
+    }
+    else
+    {
+      Eigen::MatrixXf& prev_layer_outputs = this->_layer_arrays[i - 1].GetLayerOutputs();
+      Eigen::MatrixXf& prev_head_outputs = this->_layer_arrays[i - 1].GetHeadOutputs();
+      this->_layer_arrays[i].Process(prev_layer_outputs, this->_condition_output, prev_head_outputs, num_frames);
+    }
+  }
+
+  auto& final_head_outputs = this->_layer_arrays.back().GetHeadOutputs();
+
+  if (this->_post_stack_head != nullptr)
+  {
+    assert(final_head_outputs.rows() == this->_post_stack_head->in_channels());
+    const int head_in = this->_post_stack_head->in_channels();
+    for (int ch = 0; ch < head_in; ch++)
+    {
+      for (int s = 0; s < num_frames; s++)
+        this->_scaled_head_scratch(ch, s) = this->_head_scale * final_head_outputs(ch, s);
+    }
+
+    this->_post_stack_head->process(this->_scaled_head_scratch, num_frames);
+    const Eigen::MatrixXf& head_out = this->_post_stack_head->get_last_output();
+    assert(head_out.rows() == 1);
+
+    const float* __restrict__ src = head_out.data();
+    for (int s = 0; s < num_frames; s++)
+      output[static_cast<size_t>(s) * outputStride] = (NAM_SAMPLE)src[s];
+    return;
+  }
+
+  assert(final_head_outputs.rows() == 1);
+
+  const float scale = this->_head_scale;
+  const float* __restrict__ src = final_head_outputs.data();
+  for (int s = 0; s < num_frames; s++)
+    output[static_cast<size_t>(s) * outputStride] = (NAM_SAMPLE)(scale * src[s]);
 }
 
 // Config parser - extracts all configuration from JSON without constructing the DSP

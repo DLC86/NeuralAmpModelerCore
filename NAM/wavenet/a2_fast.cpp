@@ -11,8 +11,10 @@
   #include "a2_fast.h"
 
   #include <algorithm>
+  #include <atomic>
   #include <array>
   #include <cmath>
+  #include <cstdlib>
   #include <cstddef>
   #include <cstring>
   #include <iterator>
@@ -20,10 +22,36 @@
   #include <sstream>
   #include <stdexcept>
   #include <string>
+  #include <thread>
   #include <utility>
   #include <vector>
 
   #include <Eigen/Dense>
+
+  #if defined(_OPENMP)
+
+struct NAM_A2FrameOMPRuntimeConfig
+{
+  // -1 = no plugin override; fall back to environment variables.
+  std::atomic<int> enabled {-1};
+  std::atomic<int> threads {0};
+  std::atomic<int> minFrames {1024};
+  std::atomic<int> minChunk {128};
+};
+
+NAM_A2FrameOMPRuntimeConfig& NAM_A2FrameOMPRuntime()
+{
+  static NAM_A2FrameOMPRuntimeConfig config;
+  return config;
+}
+
+int NAM_A2RuntimeClamp(int v, int lo, int hi)
+{
+  return std::max(lo, std::min(hi, v));
+}
+
+    #include <omp.h>
+  #endif
 
   #include "../dsp.h"
 
@@ -36,6 +64,96 @@ namespace a2_fast
 
 namespace
 {
+
+#if defined(_OPENMP)
+int NAM_A2EnvInt(const char* name, int defaultValue, int minValue, int maxValue)
+{
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0')
+    return defaultValue;
+
+  char* end = nullptr;
+  const long parsed = std::strtol(v, &end, 10);
+  if (end == v)
+    return defaultValue;
+
+  if (parsed < minValue)
+    return minValue;
+  if (parsed > maxValue)
+    return maxValue;
+  return static_cast<int>(parsed);
+}
+
+bool NAM_A2EnvFlag(const char* name, bool defaultValue)
+{
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0')
+    return defaultValue;
+
+  return !(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+}
+
+int NAM_A2FrameOMPThreads()
+{
+  auto& runtime = NAM_A2FrameOMPRuntime();
+  const int runtimeThreads = runtime.threads.load();
+  if (runtimeThreads > 0)
+    return NAM_A2RuntimeClamp(runtimeThreads, 1, 64);
+
+  const unsigned hardware = std::thread::hardware_concurrency();
+  const int logical = hardware > 0 ? static_cast<int>(hardware) : 4;
+  const int fallback = std::max(2, logical - 4);
+  return NAM_A2EnvInt("NAM_A2_FRAME_OMP_THREADS", fallback, 1, 64);
+}
+
+int NAM_A2FrameOMPMinFrames()
+{
+  auto& runtime = NAM_A2FrameOMPRuntime();
+  const int runtimeMinFrames = runtime.minFrames.load();
+  if (runtimeMinFrames > 0)
+    return NAM_A2RuntimeClamp(runtimeMinFrames, 1, 1048576);
+
+  return NAM_A2EnvInt("NAM_A2_FRAME_OMP_MIN_FRAMES", 1024, 1, 1048576);
+}
+
+int NAM_A2FrameOMPMinChunk()
+{
+  auto& runtime = NAM_A2FrameOMPRuntime();
+  const int runtimeMinChunk = runtime.minChunk.load();
+  if (runtimeMinChunk > 0)
+    return NAM_A2RuntimeClamp(runtimeMinChunk, 32, 1048576);
+
+  return NAM_A2EnvInt("NAM_A2_FRAME_OMP_MIN_CHUNK", 256, 32, 1048576);
+}
+
+bool NAM_A2FrameOMPEnabled(const int num_frames)
+{
+  auto& runtime = NAM_A2FrameOMPRuntime();
+  const int runtimeEnabled = runtime.enabled.load();
+
+  const bool enabled =
+    runtimeEnabled >= 0 ? (runtimeEnabled != 0) : NAM_A2EnvFlag("NAM_A2_FRAME_OMP", false);
+
+  if (!enabled)
+    return false;
+
+  const int threads = NAM_A2FrameOMPThreads();
+  if (threads <= 1 || num_frames < NAM_A2FrameOMPMinFrames())
+    return false;
+
+  // Keep this dynamic: the plugin UI can change OS Threads at runtime.
+  // The actual processing loop also uses the current numThreads value, but
+  // updating OpenMP here keeps runtime behavior consistent across hosts.
+  omp_set_dynamic(0);
+  omp_set_num_threads(threads);
+
+  // We are parallelizing across frame chunks explicitly. Keep Eigen's own
+  // thread pool disabled to avoid nested OpenMP oversubscription.
+  Eigen::setNbThreads(1);
+
+  return true;
+}
+#endif
 
 // =============================================================================
 // A2FastModel<Channels>
@@ -63,9 +181,15 @@ public:
   static constexpr int kHeadIn = Channels;
 
   A2FastModel(std::vector<float> weights, double expected_sample_rate);
+  A2FastModel(std::shared_ptr<const std::vector<float>> weights, double expected_sample_rate);
+  A2FastModel(const A2FastModel& other);
   ~A2FastModel() override = default;
 
+  std::unique_ptr<DSP> CloneForPhase() const override;
+  bool SupportsStridedProcess() const override { return true; }
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames) override;
+  void process_strided(const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride,
+                       const int num_frames) override;
   void SetTimeScale(const int scale) override;
 
 protected:
@@ -79,17 +203,14 @@ private:
     int dilation = 0;
     int max_lookback = 0; // (kernel_size - 1) * dilation
 
-    // Dilated conv (Channels -> Bottleneck), column-major per tap.
-    // Flat size = kernel_size * Channels * Bottleneck.
-    std::vector<float> conv_w;
-    std::array<float, Channels> conv_b{};
-
-    // Input mixin (cond_size=1 -> Bottleneck), no bias.
-    std::array<float, Channels> mixin_w{};
-
-    // layer1x1 (Bottleneck -> Channels), with bias. Column-major (Channels × Bottleneck).
-    std::array<float, Channels * Channels> l1x1_w{};
-    std::array<float, Channels> l1x1_b{};
+    // Shared immutable weights/config. Per-phase clones copy these shared_ptrs
+    // and allocate only history/work buffers.
+    std::shared_ptr<std::vector<float>> conv_w = std::make_shared<std::vector<float>>();
+    std::shared_ptr<std::array<float, Channels>> conv_b = std::make_shared<std::array<float, Channels>>();
+    std::shared_ptr<std::array<float, Channels>> mixin_w = std::make_shared<std::array<float, Channels>>();
+    std::shared_ptr<std::array<float, Channels * Channels>> l1x1_w =
+      std::make_shared<std::array<float, Channels * Channels>>();
+    std::shared_ptr<std::array<float, Channels>> l1x1_b = std::make_shared<std::array<float, Channels>>();
 
     // Conv1D input history ring buffer, column-major (Channels rows).
     std::vector<float> history;
@@ -112,16 +233,17 @@ private:
   std::array<Layer, kNumLayers> _layers;
 
   // Rechannel (input_size=1 -> Channels), no bias.
-  std::array<float, Channels> _rechannel_w{};
+  std::shared_ptr<std::array<float, Channels>> _rechannel_w = std::make_shared<std::array<float, Channels>>();
 
   // Head rechannel (Bottleneck -> 1), kernel=16, bias. Column-major per tap.
   // At each tap, matrix is (1 × Channels) col-major -> Channels floats.
-  std::array<std::array<float, Channels>, kHeadKernelSize> _head_w{};
-  float _head_b = 0.0f;
+  std::shared_ptr<std::array<std::array<float, Channels>, kHeadKernelSize>> _head_w =
+    std::make_shared<std::array<std::array<float, Channels>, kHeadKernelSize>>();
+  std::shared_ptr<float> _head_b = std::make_shared<float>(0.0f);
 
   // Head scale is stored as the trailing float in the weights stream (the generic
   // WaveNet reads it the same way, overriding the JSON head_scale field).
-  float _head_scale = 1.0f;
+  std::shared_ptr<float> _head_scale = std::make_shared<float>(1.0f);
   int _time_scale = 1;
   int _head_dilation = 1;
 
@@ -171,12 +293,53 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
     _layers[i].kernel_size = kKernelSizes[i];
     _layers[i].dilation = kDilations[i];
     _layers[i].max_lookback = (kKernelSizes[i] - 1) * kDilations[i];
-    _layers[i].conv_w.assign(static_cast<size_t>(kKernelSizes[i]) * Channels * Channels, 0.0f);
+    _layers[i].conv_w->assign(static_cast<size_t>(kKernelSizes[i]) * Channels * Channels, 0.0f);
   }
 
   _load_weights(weights);
 
   _update_time_scaled_dilations();
+}
+
+template <int Channels>
+A2FastModel<Channels>::A2FastModel(std::shared_ptr<const std::vector<float>> weights, double expected_sample_rate)
+: DSP(/*in_channels=*/1, /*out_channels=*/1, expected_sample_rate)
+{
+  if (!weights)
+    throw std::runtime_error("A2FastModel: null shared weight vector");
+
+  std::vector<float> localWeights(weights->begin(), weights->end());
+  for (int i = 0; i < kNumLayers; i++)
+  {
+    _layers[i].kernel_size = kKernelSizes[i];
+    _layers[i].dilation = kDilations[i];
+    _layers[i].max_lookback = (kKernelSizes[i] - 1) * kDilations[i];
+    _layers[i].conv_w->assign(static_cast<size_t>(kKernelSizes[i]) * Channels * Channels, 0.0f);
+  }
+
+  _load_weights(localWeights);
+
+  _update_time_scaled_dilations();
+}
+
+template <int Channels>
+A2FastModel<Channels>::A2FastModel(const A2FastModel& other)
+: DSP(/*in_channels=*/1, /*out_channels=*/1, other.GetExpectedSampleRate())
+, _layers(other._layers)
+, _rechannel_w(other._rechannel_w)
+, _head_w(other._head_w)
+, _head_b(other._head_b)
+, _head_scale(other._head_scale)
+, _time_scale(other._time_scale)
+, _head_dilation(other._head_dilation)
+, _prewarm_samples(other._prewarm_samples)
+{
+}
+
+template <int Channels>
+std::unique_ptr<DSP> A2FastModel<Channels>::CloneForPhase() const
+{
+  return std::make_unique<A2FastModel<Channels>>(*this);
 }
 
 template <int Channels>
@@ -234,7 +397,7 @@ void A2FastModel<Channels>::_load_weights(std::vector<float>& weights)
 
   // Rechannel: 1 -> Channels, no bias. Read order: for i in Channels: for j in 1.
   for (int i = 0; i < Channels; i++)
-    _rechannel_w[i] = take();
+    (*_rechannel_w)[i] = take();
 
   for (int li = 0; li < kNumLayers; li++)
   {
@@ -250,16 +413,16 @@ void A2FastModel<Channels>::_load_weights(std::vector<float>& weights)
       {
         for (int k = 0; k < K; k++)
         {
-          L.conv_w[k * Channels * Channels + j * Channels + i] = take();
+          (*L.conv_w)[k * Channels * Channels + j * Channels + i] = take();
         }
       }
     }
     for (int i = 0; i < Channels; i++)
-      L.conv_b[i] = take();
+      (*L.conv_b)[i] = take();
 
     // Input mixin: 1 -> Bottleneck, no bias. Read order: for i in Bottleneck: for j in 1.
     for (int i = 0; i < Channels; i++)
-      L.mixin_w[i] = take();
+      (*L.mixin_w)[i] = take();
 
     // layer1x1: Bottleneck -> Channels, with bias. Read order: for i in Channels: for j in Bottleneck.
     // Store at l1x1_w[j * Channels + i] (col-major Channels × Bottleneck).
@@ -267,27 +430,27 @@ void A2FastModel<Channels>::_load_weights(std::vector<float>& weights)
     {
       for (int j = 0; j < Channels; j++) // col (in = Bottleneck)
       {
-        L.l1x1_w[j * Channels + i] = take();
+        (*L.l1x1_w)[j * Channels + i] = take();
       }
     }
     for (int i = 0; i < Channels; i++)
-      L.l1x1_b[i] = take();
+      (*L.l1x1_b)[i] = take();
   }
 
   // Head rechannel: Bottleneck -> 1, kernel=16, bias.
   // Read order: for i in 1: for j in Bottleneck: for k in 16.
-  // Store at _head_w[k][j] (row=0 since out=1, column-major => just Channels floats per tap).
+  // Store at (*_head_w)[k][j] (row=0 since out=1, column-major => just Channels floats per tap).
   for (int j = 0; j < Channels; j++)
   {
     for (int k = 0; k < kHeadKernelSize; k++)
     {
-      _head_w[k][j] = take();
+      (*_head_w)[k][j] = take();
     }
   }
-  _head_b = take();
+  *_head_b = take();
 
   // Matches WaveNet::set_weights_: the last value in the stream is head_scale.
-  _head_scale = take();
+  *_head_scale = take();
 
   if (it != end)
   {
@@ -476,12 +639,12 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     // Tap 0: seed z with conv_b (saves the memset-to-zero pass) and fold in
     // the first tap's FMAs.
     {
-      const float* wk = &L.conv_w[0];
+      const float* wk = &(*L.conv_w)[0];
       const int tap_base = tap_base_phys(K - 1);
       const float w0 = wk[0], w1 = wk[1], w2 = wk[2];
       const float w3 = wk[3], w4 = wk[4], w5 = wk[5];
       const float w6 = wk[6], w7 = wk[7], w8 = wk[8];
-      const float cb0 = L.conv_b[0], cb1 = L.conv_b[1], cb2 = L.conv_b[2];
+      const float cb0 = (*L.conv_b)[0], cb1 = (*L.conv_b)[1], cb2 = (*L.conv_b)[2];
       for (int f = 0; f < num_frames; f++)
       {
         const float* src = &L.history[static_cast<size_t>(tap_base + f) * 3];
@@ -504,7 +667,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     // Taps 1..K-2: accumulate into z with the same unrolled inner kernel.
     for (int k = 1; k < K - 1; k++)
     {
-      const float* wk = &L.conv_w[static_cast<size_t>(k) * 9];
+      const float* wk = &(*L.conv_w)[static_cast<size_t>(k) * 9];
       const int tap_base = tap_base_phys(K - 1 - k);
       const float w0 = wk[0], w1 = wk[1], w2 = wk[2];
       const float w3 = wk[3], w4 = wk[4], w5 = wk[5];
@@ -531,17 +694,17 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     // Final tap (K-1, offset 0) fully inlined with the post-conv tail.
     // Everything runs on register-resident scalars:
     //   conv tap K-1 -> mixin -> LeakyReLU -> head_sum += -> layer1x1 residual.
-    const float* wk_last = &L.conv_w[static_cast<size_t>(K - 1) * 9];
+    const float* wk_last = &(*L.conv_w)[static_cast<size_t>(K - 1) * 9];
     const int tap_base_last = tap_base_phys(0);
     const float cw0 = wk_last[0], cw1 = wk_last[1], cw2 = wk_last[2];
     const float cw3 = wk_last[3], cw4 = wk_last[4], cw5 = wk_last[5];
     const float cw6 = wk_last[6], cw7 = wk_last[7], cw8 = wk_last[8];
-    const float mw0 = L.mixin_w[0], mw1 = L.mixin_w[1], mw2 = L.mixin_w[2];
+    const float mw0 = (*L.mixin_w)[0], mw1 = (*L.mixin_w)[1], mw2 = (*L.mixin_w)[2];
     // layer1x1 col-major: lw[b*3 + c] is weight from bottleneck b to output c.
-    const float lw00 = L.l1x1_w[0], lw01 = L.l1x1_w[1], lw02 = L.l1x1_w[2];
-    const float lw10 = L.l1x1_w[3], lw11 = L.l1x1_w[4], lw12 = L.l1x1_w[5];
-    const float lw20 = L.l1x1_w[6], lw21 = L.l1x1_w[7], lw22 = L.l1x1_w[8];
-    const float lb0 = L.l1x1_b[0], lb1 = L.l1x1_b[1], lb2 = L.l1x1_b[2];
+    const float lw00 = (*L.l1x1_w)[0], lw01 = (*L.l1x1_w)[1], lw02 = (*L.l1x1_w)[2];
+    const float lw10 = (*L.l1x1_w)[3], lw11 = (*L.l1x1_w)[4], lw12 = (*L.l1x1_w)[5];
+    const float lw20 = (*L.l1x1_w)[6], lw21 = (*L.l1x1_w)[7], lw22 = (*L.l1x1_w)[8];
+    const float lb0 = (*L.l1x1_b)[0], lb1 = (*L.l1x1_b)[1], lb2 = (*L.l1x1_b)[2];
     for (int f = 0; f < num_frames; f++)
     {
       const float* src = &L.history[static_cast<size_t>(tap_base_last + f) * 3];
@@ -596,10 +759,62 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     using VecC = Eigen::Matrix<float, Channels, 1>;
     using RowDyn = Eigen::Matrix<float, 1, Eigen::Dynamic>;
 
-    Eigen::Map<const VecC> conv_b_vec(L.conv_b.data());
-    Eigen::Map<const VecC> mixin_vec(L.mixin_w.data());
-    Eigen::Map<const MatCC> l1x1_mat(L.l1x1_w.data());
-    Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b.data());
+    // GatewayOS-style frame OpenMP probe: one model instance, contiguous N*Fs buffer,
+    // but split each A2 layer's frame columns across worker threads.
+    #if defined(_OPENMP)
+    if (NAM_A2FrameOMPEnabled(num_frames))
+    {
+      const int maxThreads = NAM_A2FrameOMPThreads();
+      const int minFramesPerThread = NAM_A2FrameOMPMinChunk();
+      const int wantedChunks = std::max(1, (num_frames + minFramesPerThread - 1) / minFramesPerThread);
+      const int chunks = std::max(1, std::min(maxThreads, wantedChunks));
+
+      Eigen::Map<const VecC> conv_b_vec(L.conv_b->data());
+      Eigen::Map<const VecC> mixin_vec(L.mixin_w->data());
+      Eigen::Map<const MatCC> l1x1_mat(L.l1x1_w->data());
+      Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b->data());
+
+      #pragma omp parallel for schedule(static) num_threads(chunks)
+      for (int chunk = 0; chunk < chunks; chunk++)
+      {
+        const int begin = (num_frames * chunk) / chunks;
+        const int end = (num_frames * (chunk + 1)) / chunks;
+        const int n = end - begin;
+        if (n <= 0)
+          continue;
+
+        Eigen::Map<const RowDyn> cond_row(cond + begin, 1, n);
+        Eigen::Map<MatCDyn> zblock(_z.data() + static_cast<size_t>(begin) * Channels, Channels, n);
+        Eigen::Map<MatCDyn> hsum_block(_head_sum.data() + static_cast<size_t>(begin) * Channels, Channels, n);
+        Eigen::Map<MatCDyn> lin_block(_layer_in.data() + static_cast<size_t>(begin) * Channels, Channels, n);
+
+        zblock.setZero();
+
+        for (int k = 0; k < K; k++)
+        {
+          const int tap_base = tap_base_phys(K - 1 - k) + begin;
+          Eigen::Map<const MatCC> W(&(*L.conv_w)[static_cast<size_t>(k) * Channels * Channels]);
+          Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, n);
+          zblock.noalias() += W * input_block;
+        }
+
+        zblock.colwise() += conv_b_vec;
+        zblock.noalias() += mixin_vec * cond_row;
+        zblock = (zblock.array() < 0.0f).select(zblock.array() * kLeakySlope, zblock.array());
+
+        hsum_block += zblock;
+        lin_block.noalias() += l1x1_mat * zblock;
+        lin_block.colwise() += l1x1_b_vec;
+      }
+
+      return;
+    }
+    #endif
+
+    Eigen::Map<const VecC> conv_b_vec(L.conv_b->data());
+    Eigen::Map<const VecC> mixin_vec(L.mixin_w->data());
+    Eigen::Map<const MatCC> l1x1_mat(L.l1x1_w->data());
+    Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b->data());
     Eigen::Map<const RowDyn> cond_row(cond, 1, num_frames);
 
     Eigen::Map<MatCDyn> ztile(_z.data(), Channels, num_frames);
@@ -612,7 +827,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     for (int k = 0; k < K; k++)
     {
       const int tap_base = tap_base_phys(K - 1 - k);
-      Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
+      Eigen::Map<const MatCC> W(&(*L.conv_w)[static_cast<size_t>(k) * Channels * Channels]);
       Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
       ztile.noalias() += W * input_block;
     }
@@ -662,16 +877,16 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
 
   for (int f = 0; f < num_frames; f++)
   {
-    float y = _head_b;
+    float y = *_head_b;
     for (int k = 0; k < kHeadKernelSize; k++)
     {
       const int col = col_of(f, k);
       const float* src = &_head_history[static_cast<size_t>(col) * Channels];
-      const float* wk = _head_w[k].data();
+      const float* wk = (*_head_w)[k].data();
       for (int b = 0; b < Channels; b++)
         y += wk[b] * src[b];
     }
-    output[f] = y * _head_scale;
+    output[f] = y * (*_head_scale);
   }
 }
 
@@ -681,22 +896,28 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
 template <int Channels>
 void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames)
 {
+  process_strided(input[0], 1, output[0], 1, num_frames);
+}
+
+template <int Channels>
+void A2FastModel<Channels>::process_strided(
+  const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride, const int num_frames)
+{
   if (num_frames > GetMaxBufferSize())
     SetMaxBufferSize(num_frames);
 
-  const NAM_SAMPLE* in0 = input[0];
-  NAM_SAMPLE* out0 = output[0];
-
-  // Rechannel: layer_in[c, f] = _rechannel_w[c] * input[f] for c in Channels.
-  // Also prepare float cond buffer (input copied to float for inner loops).
+  // Rechannel: layer_in[c, f] = rechannel_w[c] * input[f] for c in Channels.
+  // Also prepare float cond buffer. In phase-parallel oversampling, inputStride
+  // is the oversampling phase count, so this reads the target phase directly
+  // from the interleaved high-rate resampler buffer.
   float* cond = _cond.data();
   for (int f = 0; f < num_frames; f++)
   {
-    const float x = static_cast<float>(in0[f]);
+    const float x = static_cast<float>(input[static_cast<size_t>(f) * inputStride]);
     cond[f] = x;
     float* lin = &_layer_in[static_cast<size_t>(f) * Channels];
     for (int c = 0; c < Channels; c++)
-      lin[c] = _rechannel_w[c] * x;
+      lin[c] = (*_rechannel_w)[c] * x;
   }
 
   // Zero head accumulator.
@@ -705,11 +926,11 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   for (int li = 0; li < kNumLayers; li++)
     _layer_forward(li, cond, num_frames);
 
-  // Output.
+  // Output directly to the requested phase positions.
   float* head_out = _head_out.data();
   _head_forward(head_out, num_frames);
   for (int f = 0; f < num_frames; f++)
-    out0[f] = static_cast<NAM_SAMPLE>(head_out[f]);
+    output[static_cast<size_t>(f) * outputStride] = static_cast<NAM_SAMPLE>(head_out[f]);
 }
 
 // -----------------------------------------------------------------------------
@@ -721,10 +942,11 @@ struct A2FastConfig : public ModelConfig
 
   std::unique_ptr<DSP> create(std::vector<float> weights, double sampleRate) override
   {
+    auto sharedWeights = std::make_shared<const std::vector<float>>(std::move(weights));
     if (channels == 3)
-      return std::make_unique<A2FastModel<3>>(std::move(weights), sampleRate);
+      return std::make_unique<A2FastModel<3>>(std::move(sharedWeights), sampleRate);
     if (channels == 8)
-      return std::make_unique<A2FastModel<8>>(std::move(weights), sampleRate);
+      return std::make_unique<A2FastModel<8>>(std::move(sharedWeights), sampleRate);
     throw std::runtime_error("A2FastConfig: unsupported channel count " + std::to_string(channels));
   }
 };
@@ -775,9 +997,34 @@ bool film_inactive(const nlohmann::json& layer, const char* key)
 
 } // namespace
 
+void SetFrameOMPRuntimeConfig(bool enabled, int threads, int minFrames, int minChunk)
+{
+#if defined(_OPENMP)
+  auto& runtime = NAM_A2FrameOMPRuntime();
+  runtime.enabled.store(enabled ? 1 : 0);
+  runtime.threads.store(NAM_A2RuntimeClamp(threads, 0, 64));
+  runtime.minFrames.store(NAM_A2RuntimeClamp(minFrames, 1, 1048576));
+  runtime.minChunk.store(NAM_A2RuntimeClamp(minChunk, 32, 1048576));
+#else
+  (void)enabled;
+  (void)threads;
+  (void)minFrames;
+  (void)minChunk;
+#endif
+}
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
+bool is_a2_fast_dsp(const nam::DSP* dsp)
+{
+  if (dsp == nullptr)
+    return false;
+
+  return dynamic_cast<const A2FastModel<3>*>(dsp) != nullptr
+         || dynamic_cast<const A2FastModel<8>*>(dsp) != nullptr;
+}
+
 bool is_a2_shape(const nlohmann::json& config, int* channels)
 {
   // Exactly one layer array

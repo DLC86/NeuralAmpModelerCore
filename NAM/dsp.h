@@ -79,6 +79,25 @@ public:
   /// \param output Output audio buffers. Same structure as input.
   /// \param num_frames Number of frames to process
   virtual void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames);
+
+  /// \brief Whether this DSP can process mono strided input/output directly.
+  ///
+  /// This is used by the phase-parallel oversampling wrapper to avoid
+  /// deinterleaving/interleaving phase buffers for compatible backends.
+  virtual bool SupportsStridedProcess() const { return false; }
+
+  /// \brief Process mono strided input/output directly.
+  ///
+  /// Only called when SupportsStridedProcess() returns true.
+  virtual void process_strided(const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride,
+                               const int num_frames)
+  {
+    (void)input;
+    (void)inputStride;
+    (void)output;
+    (void)outputStride;
+    (void)num_frames;
+  }
   /// \brief Get the expected sample rate
   /// \return Expected sample rate in Hz (-1.0 if unknown)
   double GetExpectedSampleRate() const { return mExpectedSampleRate; };
@@ -153,6 +172,13 @@ public:
   ///
   /// Most model types do not have time-scaled convolutions, so the default is a no-op.
   virtual void SetTimeScale(const int scale) { (void)scale; }
+
+  /// \brief Create a state-only processing clone for phase-parallel oversampling.
+  ///
+  /// Implementations may share immutable weights/config with the source DSP while
+  /// allocating independent delay/history/state. Returning nullptr means the
+  /// wrapper must fall back to a full model clone loaded from disk.
+  virtual std::unique_ptr<DSP> CloneForPhase() const { return nullptr; }
 
   /// \brief Set the input level
   /// \param inputLevel Input level in dBu
