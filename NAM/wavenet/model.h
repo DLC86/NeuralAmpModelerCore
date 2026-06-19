@@ -44,7 +44,8 @@ public:
   /// \param expected_sample_rate Expected sample rate in Hz (-1.0 if unknown)
   WaveNet(const int in_channels, const std::vector<LayerArrayParams>& layer_array_params, const float head_scale,
           const bool with_head, std::optional<HeadParams> head_params, std::vector<float> weights,
-          std::unique_ptr<DSP> condition_dsp, const double expected_sample_rate = -1.0);
+          std::unique_ptr<DSP> condition_dsp, const double expected_sample_rate = -1.0,
+          nlohmann::json clone_config = nullptr);
 
   /// \brief Destructor
   ~WaveNet() = default;
@@ -61,6 +62,7 @@ public:
   bool SupportsStridedProcess() const override { return NumInputChannels() == 1 && NumOutputChannels() == 1; }
   void process_strided(const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride,
                        const int num_frames) override;
+  std::unique_ptr<DSP> CloneForPhase() const override;
 
   /// \brief Set model weights from a vector
   /// \param weights Vector containing all model weights
@@ -109,6 +111,12 @@ protected:
   virtual int _get_condition_dim() const { return NumInputChannels(); };
 
 private:
+  // Retain the compact source configuration and weights so phase clones can be
+  // created from memory without reopening the .nam file.
+  nlohmann::json _clone_config;
+  std::vector<float> _clone_weights;
+  int _time_scale = 1;
+
   std::vector<detail::LayerArray> _layer_arrays;
 
   float _head_scale;
@@ -130,6 +138,7 @@ struct WaveNetConfig : public ModelConfig
   bool with_head;
   std::optional<HeadParams> head_params;
   std::unique_ptr<DSP> condition_dsp;
+  nlohmann::json raw_config;
 
   // Move-only due to unique_ptr
   WaveNetConfig() = default;

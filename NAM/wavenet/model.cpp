@@ -567,11 +567,14 @@ nam::wavenet::WaveNet::WaveNet(const int in_channels,
                                const std::vector<nam::wavenet::LayerArrayParams>& layer_array_params,
                                const float head_scale, const bool with_head, std::optional<HeadParams> head_params,
                                std::vector<float> weights, std::unique_ptr<DSP> condition_dsp,
-                               const double expected_sample_rate)
+                               const double expected_sample_rate, nlohmann::json clone_config)
 : DSP(in_channels, wave_net_output_channels(layer_array_params, with_head, head_params), expected_sample_rate)
 , _condition_dsp(std::move(condition_dsp))
+, _clone_config(std::move(clone_config))
 , _head_scale(head_scale)
 {
+  _clone_weights = weights;
+
   // Assert that if there's a condition DSP, its input is compatible with what it'll get from this WaveNet:
   if (this->_condition_dsp != nullptr)
   {
@@ -659,18 +662,30 @@ void nam::wavenet::WaveNet::set_weights_(std::vector<float>& weights)
 
 void nam::wavenet::WaveNet::SetTimeScale(const int scale)
 {
+  _time_scale = std::max(1, scale);
   if (_condition_dsp != nullptr)
-    _condition_dsp->SetTimeScale(scale);
+    _condition_dsp->SetTimeScale(_time_scale);
   for (auto& layer_array : _layer_arrays)
-    layer_array.SetTimeScale(scale);
+    layer_array.SetTimeScale(_time_scale);
   if (_post_stack_head != nullptr)
-    _post_stack_head->SetTimeScale(scale);
+    _post_stack_head->SetTimeScale(_time_scale);
 
   mPrewarmSamples = this->_condition_dsp != nullptr ? this->_condition_dsp->PrewarmSamples() : 1;
   for (size_t i = 0; i < this->_layer_arrays.size(); i++)
     mPrewarmSamples += this->_layer_arrays[i].get_receptive_field();
   if (this->_post_stack_head != nullptr)
     mPrewarmSamples += this->_post_stack_head->receptive_field() - 1;
+}
+
+std::unique_ptr<nam::DSP> nam::wavenet::WaveNet::CloneForPhase() const
+{
+  if (_clone_config.is_null() || _clone_config.empty())
+    return nullptr;
+
+  auto config = parse_config_json(_clone_config, GetExpectedSampleRate());
+  auto clone = config.create(_clone_weights, GetExpectedSampleRate());
+  clone->SetTimeScale(_time_scale);
+  return clone;
 }
 
 void nam::wavenet::WaveNet::SetMaxBufferSize(const int maxBufferSize)
@@ -917,6 +932,7 @@ nam::wavenet::WaveNetConfig nam::wavenet::parse_config_json(const nlohmann::json
                                                             const double expectedSampleRate)
 {
   WaveNetConfig wc;
+  wc.raw_config = config;
 
   // Condition DSP (eagerly built via get_dsp)
   if ((config.find("condition_dsp") != config.end()) && !config["condition_dsp"].is_null())
@@ -1276,7 +1292,7 @@ std::unique_ptr<nam::DSP> nam::wavenet::WaveNetConfig::create(std::vector<float>
 {
   return std::make_unique<nam::wavenet::WaveNet>(in_channels, layer_array_params, head_scale, with_head,
                                                  std::move(head_params), std::move(weights), std::move(condition_dsp),
-                                                 sampleRate);
+                                                 sampleRate, std::move(raw_config));
 }
 
 namespace

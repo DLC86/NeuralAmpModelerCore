@@ -55,6 +55,24 @@ void ContainerModel::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int 
   _submodels[active_index].model->process(input, output, num_frames);
 }
 
+bool ContainerModel::SupportsStridedProcess() const
+{
+  const size_t activeIndex = _active_index.load(std::memory_order_acquire);
+  return activeIndex < _submodels.size() && _submodels[activeIndex].model
+         && _submodels[activeIndex].model->SupportsStridedProcess();
+}
+
+void ContainerModel::process_strided(
+  const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride, const int num_frames)
+{
+  const size_t activeIndex = _active_index.load(std::memory_order_acquire);
+  if (activeIndex >= _submodels.size() || !_submodels[activeIndex].model
+      || !_submodels[activeIndex].model->SupportsStridedProcess())
+    throw std::runtime_error("ContainerModel active child does not support strided processing.");
+
+  _submodels[activeIndex].model->process_strided(input, inputStride, output, outputStride, num_frames);
+}
+
 void ContainerModel::prewarm()
 {
   const size_t active_index = _active_index.load(std::memory_order_acquire);
@@ -115,6 +133,18 @@ void ContainerModel::SetSlimmableSize(const double val)
 
   // Finally set when we're ready:
   _active_index.store(active_index, std::memory_order_release);
+}
+
+std::unique_ptr<DSP> ContainerModel::CloneForPhase() const
+{
+  // A phase lane only needs the currently selected child. Returning that child
+  // directly avoids duplicating every inactive SlimmableContainer submodel for
+  // each oversampling phase.
+  const size_t activeIndex = _active_index.load(std::memory_order_acquire);
+  if (activeIndex >= _submodels.size() || !_submodels[activeIndex].model)
+    return nullptr;
+
+  return _submodels[activeIndex].model->CloneForPhase();
 }
 
 // =============================================================================

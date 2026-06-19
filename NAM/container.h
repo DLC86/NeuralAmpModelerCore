@@ -35,10 +35,14 @@ public:
   ContainerModel(std::vector<Submodel> submodels, const double expected_sample_rate);
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames) override;
+  bool SupportsStridedProcess() const override;
+  void process_strided(const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride,
+                       const int num_frames) override;
   void prewarm() override;
   void Reset(const double sampleRate, const int maxBufferSize) override;
   void SetTimeScale(const int scale) override;
   void SetSlimmableSize(const double val) override;
+  std::unique_ptr<DSP> CloneForPhase() const override;
 
 protected:
   int PrewarmSamples() override { return 0; }

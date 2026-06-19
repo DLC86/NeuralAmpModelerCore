@@ -462,7 +462,27 @@ void SlimmableWavenet::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const in
     _current_channels = std::move(pack->channels);
   }
   if (_active_model)
-    _active_model->process(input, output, num_frames);
+  _active_model->process(input, output, num_frames);
+}
+
+bool SlimmableWavenet::SupportsStridedProcess() const
+{
+  return _active_model && _active_model->SupportsStridedProcess();
+}
+
+void SlimmableWavenet::process_strided(
+  const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output, int outputStride, const int num_frames)
+{
+  if (auto pack = _pending_exchange_take_acq_rel())
+  {
+    _active_model = std::move(pack->model);
+    _current_channels = std::move(pack->channels);
+  }
+
+  if (!_active_model || !_active_model->SupportsStridedProcess())
+    throw std::runtime_error("SlimmableWavenet active model does not support strided processing.");
+
+  _active_model->process_strided(input, inputStride, output, outputStride, num_frames);
 }
 
 void SlimmableWavenet::prewarm()
@@ -507,6 +527,11 @@ void SlimmableWavenet::SetSlimmableSize(const double val)
   }
 
   _stage_rebuild_model(target);
+}
+
+std::unique_ptr<DSP> SlimmableWavenet::CloneForPhase() const
+{
+  return _active_model ? _active_model->CloneForPhase() : nullptr;
 }
 
 // ============================================================================
