@@ -219,6 +219,8 @@ private:
   {
 #if defined(__arm64__) || defined(__aarch64__)
     __asm__ __volatile__("yield");
+#elif defined(_WIN32)
+    YieldProcessor();
 #else
     std::this_thread::yield();
 #endif
@@ -251,7 +253,9 @@ private:
   {
     ConfigureWorkerThread();
     unsigned seenGeneration = 0;
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
     int idleSpins = 0;
+#endif
 
     for (;;)
     {
@@ -261,6 +265,10 @@ private:
         if (mStop.load(std::memory_order_acquire))
           return;
 
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+        // Apple Silicon benefits from staying runnable between tiny adjacent
+        // audio blocks. Do not use this on Windows: MMCSS high-priority
+        // workers would otherwise consume every logical CPU while idle.
         if (idleSpins++ < 262144)
         {
           PauseRealtimeThread();
@@ -273,11 +281,20 @@ private:
                  || mGeneration.load(std::memory_order_acquire) != seenGeneration;
         });
         idleSpins = 0;
+#else
+        std::unique_lock<std::mutex> lock(mSleepMutex);
+        mSleepCV.wait(lock, [this, seenGeneration] {
+          return mStop.load(std::memory_order_acquire)
+                 || mGeneration.load(std::memory_order_acquire) != seenGeneration;
+        });
+#endif
         continue;
       }
 
       seenGeneration = generation;
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
       idleSpins = 0;
+#endif
       if (mStop.load(std::memory_order_acquire))
         return;
 
