@@ -94,6 +94,27 @@ std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, dspData& returnedConf
 /// \return Unique pointer to a DSP object
 std::unique_ptr<DSP> get_dsp(const nlohmann::json& config);
 
+enum class OversampleEngine
+{
+  Auto,
+  DilationScale,
+  Polyphase
+};
+
+struct DSPLoadOptions
+{
+  int oversampleFactor = 1;
+  OversampleEngine oversampleEngine = OversampleEngine::Auto;
+  int oversampleThreads = 1;
+};
+
+std::unique_ptr<DSP> get_dsp(const std::filesystem::path config_filename, const DSPLoadOptions& options);
+std::unique_ptr<DSP> get_dsp(const std::filesystem::path config_filename, dspData& returnedConfig,
+                             const DSPLoadOptions& options);
+std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, const DSPLoadOptions& options);
+std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, dspData& returnedConfig, const DSPLoadOptions& options);
+std::unique_ptr<DSP> get_dsp(dspData& conf, const DSPLoadOptions& options);
+
 /// \brief Get sample rate from a .nam file
 /// \param j JSON object from the .nam file
 /// \return Sample rate in Hz, or -1 if not known (really old .nam files)

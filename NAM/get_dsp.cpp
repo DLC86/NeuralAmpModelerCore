@@ -10,6 +10,7 @@
 #include "json.hpp"
 #include "get_dsp.h"
 #include "model_config.h"
+#include "polyphase.h"
 
 namespace nam
 {
@@ -141,35 +142,49 @@ std::vector<float> GetWeights(nlohmann::json const& j)
 
 std::unique_ptr<DSP> get_dsp(const std::filesystem::path config_filename)
 {
+  return get_dsp(config_filename, DSPLoadOptions {});
+}
+
+std::unique_ptr<DSP> get_dsp(const std::filesystem::path config_filename, const DSPLoadOptions& options)
+{
   dspData temp;
-  return get_dsp(config_filename, temp);
+  return get_dsp(config_filename, temp, options);
 }
 
 std::unique_ptr<DSP> get_dsp(const nlohmann::json& config)
 {
+  return get_dsp(config, DSPLoadOptions {});
+}
+
+std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, const DSPLoadOptions& options)
+{
   dspData temp;
-  return get_dsp(config, temp);
+  return get_dsp(config, temp, options);
 }
 
 std::unique_ptr<DSP> get_dsp(const std::filesystem::path config_filename, dspData& returnedConfig)
+{
+  return get_dsp(config_filename, returnedConfig, DSPLoadOptions {});
+}
+
+std::unique_ptr<DSP> get_dsp(const std::filesystem::path config_filename, dspData& returnedConfig,
+                             const DSPLoadOptions& options)
 {
   if (!std::filesystem::exists(config_filename))
     throw std::runtime_error("Config file doesn't exist!\n");
   std::ifstream i(config_filename);
   nlohmann::json j;
   i >> j;
-  get_dsp(j, returnedConfig);
-
-  /*Copy to a new dsp_config object for get_dsp below,
-   since not sure if weights actually get modified as being non-const references on some
-   model constructors inside get_dsp(dsp_config& conf).
-   We need to return unmodified version of dsp_config via returnedConfig.*/
-  dspData conf = returnedConfig;
-
-  return get_dsp(conf);
+  return get_dsp(j, returnedConfig, options);
 }
 
 std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, dspData& returnedConfig)
+{
+  return get_dsp(config, returnedConfig, DSPLoadOptions {});
+}
+
+std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, dspData& returnedConfig,
+                             const DSPLoadOptions& options)
 {
   verify_config_version(config["version"].get<std::string>());
 
@@ -191,7 +206,7 @@ std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, dspData& returnedConf
    We need to return unmodified version of dsp_config via returnedConfig.*/
   dspData conf = returnedConfig;
 
-  return get_dsp(conf);
+  return get_dsp(conf, options);
 }
 
 // =============================================================================
@@ -236,6 +251,14 @@ std::unique_ptr<DSP> create_dsp(std::unique_ptr<ModelConfig> config, std::vector
 
 std::unique_ptr<DSP> get_dsp(dspData& conf)
 {
+  return get_dsp(conf, DSPLoadOptions {});
+}
+
+std::unique_ptr<DSP> get_dsp(dspData& conf, const DSPLoadOptions& options)
+{
+  if (options.oversampleFactor < 1)
+    throw std::invalid_argument("DSPLoadOptions::oversampleFactor must be >= 1.");
+
   verify_config_version(conf.version);
 
   // Extract metadata from JSON
@@ -253,6 +276,26 @@ std::unique_ptr<DSP> get_dsp(dspData& conf)
     metadata.loudness = extract("loudness");
     metadata.input_level = extract("input_level_dbu");
     metadata.output_level = extract("output_level_dbu");
+  }
+
+  const bool isWaveNet = conf.architecture == "WaveNet";
+  const bool isWaveNetContainer = conf.architecture == "SlimmableContainer";
+  if (options.oversampleFactor > 1 && conf.expected_sample_rate > 0.0
+      && options.oversampleEngine != OversampleEngine::DilationScale
+      && (isWaveNet || isWaveNetContainer))
+  {
+    std::vector<std::unique_ptr<DSP>> phases;
+    phases.reserve(static_cast<size_t>(options.oversampleFactor));
+    for (int phase = 0; phase < options.oversampleFactor; phase++)
+    {
+      auto phaseConfig =
+        ConfigParserRegistry::instance().parse(conf.architecture, conf.config, conf.expected_sample_rate);
+      phases.push_back(create_dsp(std::move(phaseConfig), conf.weights, metadata));
+    }
+
+    const double oversampledRate = conf.expected_sample_rate * static_cast<double>(options.oversampleFactor);
+    return std::make_unique<PolyphaseOversampledDSP>(
+      std::move(phases), oversampledRate, options.oversampleThreads);
   }
 
   auto model_config = ConfigParserRegistry::instance().parse(conf.architecture, conf.config, conf.expected_sample_rate);
