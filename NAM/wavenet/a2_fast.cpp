@@ -65,6 +65,8 @@ namespace a2_fast
 namespace
 {
 
+using AlignedFloatVector = std::vector<float, Eigen::aligned_allocator<float>>;
+
 #if defined(_OPENMP)
 int NAM_A2EnvInt(const char* name, int defaultValue, int minValue, int maxValue)
 {
@@ -205,7 +207,7 @@ private:
 
     // Shared immutable weights/config. Per-phase clones copy these shared_ptrs
     // and allocate only history/work buffers.
-    std::shared_ptr<std::vector<float>> conv_w = std::make_shared<std::vector<float>>();
+    std::shared_ptr<AlignedFloatVector> conv_w = std::make_shared<AlignedFloatVector>();
     std::shared_ptr<std::array<float, Channels>> conv_b = std::make_shared<std::array<float, Channels>>();
     std::shared_ptr<std::array<float, Channels>> mixin_w = std::make_shared<std::array<float, Channels>>();
     std::shared_ptr<std::array<float, Channels * Channels>> l1x1_w =
@@ -213,7 +215,7 @@ private:
     std::shared_ptr<std::array<float, Channels>> l1x1_b = std::make_shared<std::array<float, Channels>>();
 
     // Conv1D input history ring buffer, column-major (Channels rows).
-    std::vector<float> history;
+    AlignedFloatVector history;
   #if NAM_A2_RING_MODE == 1
     // pow2 ring + tail mirror. Storage = (pow2_size + max_buffer_size) cols.
     // write_pos is kept in [0, pow2_size), reads use (pos & pow2_mask) and are
@@ -248,7 +250,7 @@ private:
   int _head_dilation = 1;
 
   // Head ring buffer (Channels rows, col-major). Same ring layout as per-layer.
-  std::vector<float> _head_history;
+  AlignedFloatVector _head_history;
   #if NAM_A2_RING_MODE == 1
   int _head_pow2_size = 0;
   int _head_pow2_mask = 0;
@@ -259,10 +261,10 @@ private:
   #endif
 
   // Working buffers (all Channels rows, max_buffer_size cols, col-major).
-  std::vector<float> _layer_in; // current layer input / next layer input (in-place residual)
-  std::vector<float> _head_sum; // accumulates activations across all layers
-  std::vector<float> _z; // per-layer conv output accumulator (tap-major)
-  std::vector<float> _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
+  AlignedFloatVector _layer_in; // current layer input / next layer input (in-place residual)
+  AlignedFloatVector _head_sum; // accumulates activations across all layers
+  AlignedFloatVector _z; // per-layer conv output accumulator (tap-major)
+  AlignedFloatVector _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
   int _prewarm_samples = 0;
 
   void _update_time_scaled_dilations();
@@ -533,8 +535,25 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
     std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
                 static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
   }
-  std::memcpy(
-    hist + static_cast<size_t>(L.pow2_size) * Channels, hist, static_cast<size_t>(mbs) * Channels * sizeof(float));
+
+  // Keep only the modified part of the tail mirror in sync. Copying the
+  // complete max-block mirror for every layer and every process call is very
+  // expensive in hosts that use small realtime blocks.
+  if (wp < mbs)
+  {
+    const int mirroredFirst = std::min(first, mbs - wp);
+    std::memcpy(hist + static_cast<size_t>(L.pow2_size + wp) * Channels,
+                hist + static_cast<size_t>(wp) * Channels,
+                static_cast<size_t>(mirroredFirst) * Channels * sizeof(float));
+  }
+  if (first < num_frames)
+  {
+    const int wrapped = num_frames - first;
+    const int mirroredWrapped = std::min(wrapped, mbs);
+    std::memcpy(hist + static_cast<size_t>(L.pow2_size) * Channels,
+                hist,
+                static_cast<size_t>(mirroredWrapped) * Channels * sizeof(float));
+  }
   L.write_pos = (wp + num_frames) & L.pow2_mask;
   #else
   if (L.write_pos + num_frames > L.history_cols)
@@ -565,8 +584,22 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
     std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
                 static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
   }
-  std::memcpy(
-    hist + static_cast<size_t>(_head_pow2_size) * Channels, hist, static_cast<size_t>(mbs) * Channels * sizeof(float));
+
+  if (wp < mbs)
+  {
+    const int mirroredFirst = std::min(first, mbs - wp);
+    std::memcpy(hist + static_cast<size_t>(_head_pow2_size + wp) * Channels,
+                hist + static_cast<size_t>(wp) * Channels,
+                static_cast<size_t>(mirroredFirst) * Channels * sizeof(float));
+  }
+  if (first < num_frames)
+  {
+    const int wrapped = num_frames - first;
+    const int mirroredWrapped = std::min(wrapped, mbs);
+    std::memcpy(hist + static_cast<size_t>(_head_pow2_size) * Channels,
+                hist,
+                static_cast<size_t>(mirroredWrapped) * Channels * sizeof(float));
+  }
   _head_write_pos = (wp + num_frames) & _head_pow2_mask;
   #else
   const int keep = kHeadKernelSize - 1;
@@ -781,17 +814,22 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
           continue;
 
         Eigen::Map<const RowDyn> cond_row(cond + begin, 1, n);
-        Eigen::Map<MatCDyn> zblock(_z.data() + static_cast<size_t>(begin) * Channels, Channels, n);
-        Eigen::Map<MatCDyn> hsum_block(_head_sum.data() + static_cast<size_t>(begin) * Channels, Channels, n);
-        Eigen::Map<MatCDyn> lin_block(_layer_in.data() + static_cast<size_t>(begin) * Channels, Channels, n);
+        Eigen::Map<MatCDyn, Eigen::Aligned32> zblock(
+          _z.data() + static_cast<size_t>(begin) * Channels, Channels, n);
+        Eigen::Map<MatCDyn, Eigen::Aligned32> hsum_block(
+          _head_sum.data() + static_cast<size_t>(begin) * Channels, Channels, n);
+        Eigen::Map<MatCDyn, Eigen::Aligned32> lin_block(
+          _layer_in.data() + static_cast<size_t>(begin) * Channels, Channels, n);
 
         zblock.setZero();
 
         for (int k = 0; k < K; k++)
         {
           const int tap_base = tap_base_phys(K - 1 - k) + begin;
-          Eigen::Map<const MatCC> W(&(*L.conv_w)[static_cast<size_t>(k) * Channels * Channels]);
-          Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, n);
+          Eigen::Map<const MatCC, Eigen::Aligned32> W(
+            &(*L.conv_w)[static_cast<size_t>(k) * Channels * Channels]);
+          Eigen::Map<const MatCDyn, Eigen::Aligned32> input_block(
+            &L.history[static_cast<size_t>(tap_base) * Channels], Channels, n);
           zblock.noalias() += W * input_block;
         }
 
@@ -814,18 +852,26 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b->data());
     Eigen::Map<const RowDyn> cond_row(cond, 1, num_frames);
 
-    Eigen::Map<MatCDyn> ztile(_z.data(), Channels, num_frames);
-    Eigen::Map<MatCDyn> hsum_block(_head_sum.data(), Channels, num_frames);
-    Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, num_frames);
+    Eigen::Map<MatCDyn, Eigen::Aligned32> ztile(_z.data(), Channels, num_frames);
+    Eigen::Map<MatCDyn, Eigen::Aligned32> hsum_block(_head_sum.data(), Channels, num_frames);
+    Eigen::Map<MatCDyn, Eigen::Aligned32> lin_block(_layer_in.data(), Channels, num_frames);
 
-    ztile.setZero();
+    {
+      const int tap_base = tap_base_phys(K - 1);
+      Eigen::Map<const MatCC, Eigen::Aligned32> W(&(*L.conv_w)[0]);
+      Eigen::Map<const MatCDyn, Eigen::Aligned32> input_block(
+        &L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
+      ztile.noalias() = W * input_block;
+    }
 
     // Conv: one 8x8 × 8xN GEMM per tap.
-    for (int k = 0; k < K; k++)
+    for (int k = 1; k < K; k++)
     {
       const int tap_base = tap_base_phys(K - 1 - k);
-      Eigen::Map<const MatCC> W(&(*L.conv_w)[static_cast<size_t>(k) * Channels * Channels]);
-      Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
+      Eigen::Map<const MatCC, Eigen::Aligned32> W(
+        &(*L.conv_w)[static_cast<size_t>(k) * Channels * Channels]);
+      Eigen::Map<const MatCDyn, Eigen::Aligned32> input_block(
+        &L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
       ztile.noalias() += W * input_block;
     }
 
@@ -918,7 +964,6 @@ void A2FastModel<Channels>::process_strided(
       lin[c] = (*_rechannel_w)[c] * x;
   }
 
-  // Zero head accumulator.
   std::memset(_head_sum.data(), 0, static_cast<size_t>(num_frames) * Channels * sizeof(float));
 
   for (int li = 0; li < kNumLayers; li++)
