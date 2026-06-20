@@ -253,8 +253,13 @@ private:
   {
     ConfigureWorkerThread();
     unsigned seenGeneration = 0;
-#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+#if (defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))) || defined(_WIN32)
     int idleSpins = 0;
+#endif
+#if defined(_WIN32)
+    // Keep the total busy-wait cost roughly constant instead of multiplying it
+    // by 7-31 MMCSS workers at high oversampling factors.
+    const int windowsSpinLimit = std::clamp(65536 / std::max(1, mThreads - 1), 512, 8192);
 #endif
 
     for (;;)
@@ -281,6 +286,22 @@ private:
                  || mGeneration.load(std::memory_order_acquire) != seenGeneration;
         });
         idleSpins = 0;
+#elif defined(_WIN32)
+        // A short processor-pause window avoids paying a kernel wake-up for
+        // every small audio block. Its aggregate budget is capped above, so
+        // increasing the oversampling factor cannot starve Windows again.
+        if (idleSpins++ < windowsSpinLimit)
+        {
+          PauseRealtimeThread();
+          continue;
+        }
+
+        std::unique_lock<std::mutex> lock(mSleepMutex);
+        mSleepCV.wait(lock, [this, seenGeneration] {
+          return mStop.load(std::memory_order_acquire)
+                 || mGeneration.load(std::memory_order_acquire) != seenGeneration;
+        });
+        idleSpins = 0;
 #else
         std::unique_lock<std::mutex> lock(mSleepMutex);
         mSleepCV.wait(lock, [this, seenGeneration] {
@@ -292,7 +313,7 @@ private:
       }
 
       seenGeneration = generation;
-#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+#if (defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))) || defined(_WIN32)
       idleSpins = 0;
 #endif
       if (mStop.load(std::memory_order_acquire))
