@@ -263,8 +263,6 @@ private:
   std::vector<float> _head_sum; // accumulates activations across all layers
   std::vector<float> _z; // per-layer conv output accumulator (tap-major)
   std::vector<float> _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
-  std::vector<float> _head_out; // float32 head output before writing to NAM_SAMPLE
-
   int _prewarm_samples = 0;
 
   void _update_time_scaled_dilations();
@@ -272,7 +270,7 @@ private:
   void _ring_write(Layer& L, int num_frames);
   void _head_ring_write(int num_frames);
   void _layer_forward(int layer_idx, const float* cond, int num_frames);
-  void _head_forward(float* output, int num_frames);
+  void _head_forward(NAM_SAMPLE* output, int outputStride, int num_frames);
 
   // Compile-time-specialized per-layer kernel. KernelSize is lifted to a
   // template parameter so clang can fully unroll the tap loop and schedule
@@ -484,7 +482,6 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   _head_sum.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
   _z.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
   _cond.assign(static_cast<size_t>(maxBufferSize), 0.0f);
-  _head_out.assign(static_cast<size_t>(maxBufferSize), 0.0f);
 
   for (auto& L : _layers)
   {
@@ -862,7 +859,7 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
 // Head: K=16 dilation-1 conv from Channels to 1, plus bias + scale.
 // -----------------------------------------------------------------------------
 template <int Channels>
-void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
+void A2FastModel<Channels>::_head_forward(NAM_SAMPLE* output, int outputStride, int num_frames)
 {
   _head_ring_write(num_frames);
   #if NAM_A2_RING_MODE == 1
@@ -886,7 +883,8 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
       for (int b = 0; b < Channels; b++)
         y += wk[b] * src[b];
     }
-    output[f] = y * (*_head_scale);
+    output[static_cast<size_t>(f) * outputStride] =
+      static_cast<NAM_SAMPLE>(y * (*_head_scale));
   }
 }
 
@@ -926,11 +924,9 @@ void A2FastModel<Channels>::process_strided(
   for (int li = 0; li < kNumLayers; li++)
     _layer_forward(li, cond, num_frames);
 
-  // Output directly to the requested phase positions.
-  float* head_out = _head_out.data();
-  _head_forward(head_out, num_frames);
-  for (int f = 0; f < num_frames; f++)
-    output[static_cast<size_t>(f) * outputStride] = static_cast<NAM_SAMPLE>(head_out[f]);
+  // Fuse the float-to-NAM_SAMPLE conversion into the head kernel so there is
+  // no temporary output buffer and no second pass over the block.
+  _head_forward(output, outputStride, num_frames);
 }
 
 // -----------------------------------------------------------------------------
