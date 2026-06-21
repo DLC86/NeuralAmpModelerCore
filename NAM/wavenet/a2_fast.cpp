@@ -7,6 +7,9 @@
   #ifndef NAM_A2_RING_MODE
     #define NAM_A2_RING_MODE 1
   #endif
+  #ifndef NAM_A2_RESIDUAL_SIMD
+    #define NAM_A2_RESIDUAL_SIMD 1
+  #endif
 
   #include "a2_fast.h"
 
@@ -27,6 +30,12 @@
   #include <vector>
 
   #include <Eigen/Dense>
+
+  #if defined(__AVX__) || defined(_M_AVX) || defined(__SSE2__) || defined(_M_X64)
+    #include <immintrin.h>
+  #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    #include <arm_neon.h>
+  #endif
 
   #if defined(_OPENMP)
 
@@ -880,8 +889,64 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     ztile.noalias() += mixin_vec * cond_row; // rank-1 outer product
     ztile = (ztile.array() < 0.0f).select(ztile.array() * kLeakySlope, ztile.array());
     hsum_block += ztile;
-    lin_block.noalias() += l1x1_mat * ztile; // 8x8 × 8xN GEMM
+    #if NAM_A2_RESIDUAL_SIMD && (defined(__AVX__) || defined(_M_AVX))
+    const float* const residualWeights = L.l1x1_w->data();
+    const __m256 residualBias = _mm256_loadu_ps(L.l1x1_b->data());
+    for (int f = 0; f < num_frames; f++)
+    {
+      const float* const zFrame = _z.data() + static_cast<size_t>(f) * 8;
+      float* const linFrame = _layer_in.data() + static_cast<size_t>(f) * 8;
+      __m256 sum = _mm256_add_ps(_mm256_load_ps(linFrame), residualBias);
+      for (int c = 0; c < 8; c++)
+      {
+        const __m256 weights = _mm256_loadu_ps(residualWeights + static_cast<size_t>(c) * 8);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(weights, _mm256_set1_ps(zFrame[c])));
+      }
+      _mm256_store_ps(linFrame, sum);
+    }
+    #elif NAM_A2_RESIDUAL_SIMD && (defined(__SSE2__) || defined(_M_X64))
+    const float* const residualWeights = L.l1x1_w->data();
+    const __m128 biasLo = _mm_loadu_ps(L.l1x1_b->data());
+    const __m128 biasHi = _mm_loadu_ps(L.l1x1_b->data() + 4);
+    for (int f = 0; f < num_frames; f++)
+    {
+      const float* const zFrame = _z.data() + static_cast<size_t>(f) * 8;
+      float* const linFrame = _layer_in.data() + static_cast<size_t>(f) * 8;
+      __m128 sumLo = _mm_add_ps(_mm_load_ps(linFrame), biasLo);
+      __m128 sumHi = _mm_add_ps(_mm_load_ps(linFrame + 4), biasHi);
+      for (int c = 0; c < 8; c++)
+      {
+        const float* const weights = residualWeights + static_cast<size_t>(c) * 8;
+        const __m128 value = _mm_set1_ps(zFrame[c]);
+        sumLo = _mm_add_ps(sumLo, _mm_mul_ps(_mm_loadu_ps(weights), value));
+        sumHi = _mm_add_ps(sumHi, _mm_mul_ps(_mm_loadu_ps(weights + 4), value));
+      }
+      _mm_store_ps(linFrame, sumLo);
+      _mm_store_ps(linFrame + 4, sumHi);
+    }
+    #elif NAM_A2_RESIDUAL_SIMD && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    const float* const residualWeights = L.l1x1_w->data();
+    const float32x4_t biasLo = vld1q_f32(L.l1x1_b->data());
+    const float32x4_t biasHi = vld1q_f32(L.l1x1_b->data() + 4);
+    for (int f = 0; f < num_frames; f++)
+    {
+      const float* const zFrame = _z.data() + static_cast<size_t>(f) * 8;
+      float* const linFrame = _layer_in.data() + static_cast<size_t>(f) * 8;
+      float32x4_t sumLo = vaddq_f32(vld1q_f32(linFrame), biasLo);
+      float32x4_t sumHi = vaddq_f32(vld1q_f32(linFrame + 4), biasHi);
+      for (int c = 0; c < 8; c++)
+      {
+        const float* const weights = residualWeights + static_cast<size_t>(c) * 8;
+        sumLo = vmlaq_n_f32(sumLo, vld1q_f32(weights), zFrame[c]);
+        sumHi = vmlaq_n_f32(sumHi, vld1q_f32(weights + 4), zFrame[c]);
+      }
+      vst1q_f32(linFrame, sumLo);
+      vst1q_f32(linFrame + 4, sumHi);
+    }
+    #else
+    lin_block.noalias() += l1x1_mat * ztile;
     lin_block.colwise() += l1x1_b_vec;
+    #endif
   }
 }
 
